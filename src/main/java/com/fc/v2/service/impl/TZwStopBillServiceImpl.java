@@ -1,22 +1,24 @@
 package com.fc.v2.service.impl;
 
-import java.text.SimpleDateFormat;
+import java.util.ArrayList;
 import java.util.Date;
+import java.util.List;
 
 import org.springframework.stereotype.Service;
 
-import com.baomidou.mybatisplus.core.conditions.update.UpdateWrapper;
+import com.baomidou.mybatisplus.core.conditions.Wrapper;
+import com.baomidou.mybatisplus.core.conditions.query.QueryWrapper;
 import com.fc.v2.mapper.auto.TZwStopBillMapper;
 import com.fc.v2.model.auto.TZwStopBill;
 import com.fc.v2.service.ITZwStopBillService;
+import com.fc.v2.service.zw.GateView;
+import com.fc.v2.service.zw.StopBillView;
 
 /**
  * 停供/限供申请签核单 Service业务层处理（approval-chain 形状：多阶段签批）
  *
- * <p>报批情形（在核/已核讫/已打回）与当前所在道、本口落印数永远同一条更新落定，
- * 谁也不许只挪一样：否决必落"已打回"，退回必改回"在核"，核讫必连同最后一道一起钉。
- * 只有"在核"的单收票——已核讫、已打回的不再参与签批，杜绝处理完又被拉进来签一遍。
- * 全部走带"当前道/报批情形"条件的原子更新，并发签批与退回撞车时 0 行即被拒，两边同口径。
+ * <p>本骨架只把关口次序和报批情形这两个最基本的面搭起来，会签如何点算、
+ * 落印台账怎么记、打回之后如何作废重攒，都还没做——题面要的就是这几件事。
  *
  * @author fuce
  * @date 2026-09-14
@@ -24,13 +26,18 @@ import com.fc.v2.service.ITZwStopBillService;
 @Service
 public class TZwStopBillServiceImpl implements ITZwStopBillService {
 
-    /** 道次：业务提 / 水质核 / 调度准，推进到该道即全部核讫 */
-    private static final int MAX_NODE = 2;
-    private static final int MODE_OR = 0;
-    private static final int MODE_AND = 1;
+    /** 当前所在道的取值范围：0..3 */
+    private static final int MAX_NODE = 3;
+
+    /** 报批情形：0 在核 / 1 已核讫 / 2 已终止 */
     private static final int STATUS_RUNNING = 0;
     private static final int STATUS_PASS = 1;
-    private static final int STATUS_VETO = 2;
+    private static final int STATUS_STOPPED = 2;
+
+    /** 停水事由 */
+    private static final String REASON_DEPLETED = "DEPLETED";
+    private static final String REASON_OVER_LIMIT = "OVER_LIMIT";
+    private static final String REASON_REPAIR = "REPAIR";
 
     @javax.annotation.Resource
     private TZwStopBillMapper zwStopBillMapper;
@@ -40,119 +47,157 @@ public class TZwStopBillServiceImpl implements ITZwStopBillService {
         return this.zwStopBillMapper.selectById(id);
     }
 
-    /**
-     * 签批一票。
-     * 任一人制：一票即进下一道；两名点齐制：本口落印数 +1，未点齐留在本口继续在核，点齐才进道。
-     * 推进到调度准（最后一道）即落"已核讫"。非"在核"单、越道签批一律被拒。
-     */
+    @Override
+    public List<TZwStopBill> selectTZwStopBillList(Wrapper<TZwStopBill> queryWrapper) {
+        return this.zwStopBillMapper.selectList(queryWrapper);
+    }
+
+    @Override
+    public TZwStopBill submit(String siteNo, String reason, String altPlan, String applicant, String opinion) {
+        if (siteNo == null || siteNo.trim().isEmpty()) {
+            return null;
+        }
+        if (!REASON_DEPLETED.equals(reason) && !REASON_OVER_LIMIT.equals(reason)
+                && !REASON_REPAIR.equals(reason)) {
+            return null;
+        }
+        if (altPlan == null || altPlan.trim().isEmpty()) {
+            return null;
+        }
+        int year = yearOf(new Date());
+        TZwStopBill r = new TZwStopBill();
+        r.setBillNo(siteNo.trim() + "-" + year + "-01");
+        r.setSiteNo(siteNo.trim());
+        r.setBillYear(Integer.valueOf(year));
+        r.setYearSeq(Integer.valueOf(1));
+        r.setReason(reason);
+        r.setAltPlan(altPlan.trim());
+        r.setNodeNo(Integer.valueOf(0));
+        r.setRoundNo(Integer.valueOf(1));
+        r.setStatus(Integer.valueOf(STATUS_RUNNING));
+        if (this.zwStopBillMapper.insert(r) != 1) {
+            return null;
+        }
+        // TODO 提单即落业务科自己的名，单子进第二道；公告文案也要按事由从名录带出
+        return this.zwStopBillMapper.selectById(r.getId());
+    }
+
+    /** 老签法（入参与返回照旧）：当前关口的同意签批 */
     @Override
     public TZwStopBill approve(Long id, String approver, String comment) {
-        TZwStopBill r = this.zwStopBillMapper.selectById(id);
-        if (r == null || approver == null || approver.trim().isEmpty()) {
-            return null;
-        }
-        // 只收在核的票：已核讫的不再签，已打回的须先退回环节
-        if (r.getStatus() == null || r.getStatus() != STATUS_RUNNING) {
-            return null;
-        }
-        int node = r.getNodeNo() == null ? 0 : r.getNodeNo();
-        if (node >= MAX_NODE) {
-            return null;
-        }
-        int mode = r.getSignMode() == null ? MODE_OR : r.getSignMode();
-        int signed = r.getSignCount() == null ? 0 : r.getSignCount();
-        int need = r.getNeedCount() == null ? 1 : Math.max(1, r.getNeedCount().intValue());
-
-        int nextNode;
-        int nextSigned;
-        int nextStatus;
-        if (mode == MODE_AND && signed + 1 < need) {
-            // 两名未点齐：留在本口，继续在核
-            nextNode = node;
-            nextSigned = signed + 1;
-            nextStatus = STATUS_RUNNING;
-        } else {
-            // 本口点齐（或任一人制）：印数清零后进下一道；到调度准即核讫
-            nextNode = node + 1;
-            nextSigned = 0;
-            nextStatus = nextNode >= MAX_NODE ? STATUS_PASS : STATUS_RUNNING;
-        }
-        int rows = this.zwStopBillMapper.update(null, new UpdateWrapper<TZwStopBill>()
-                .set("node_no", nextNode)
-                .set("sign_count", nextSigned)
-                // 道次、落印数、报批情形三样一次钉齐，缺一样都不算成
-                .set("status", nextStatus)
-                .set("remark", appendTrace(r.getRemark(),
-                        "同意 " + ts() + " " + approver + " " + safe(comment)))
-                .eq("id", id)
-                .eq("node_no", node)
-                .eq("status", STATUS_RUNNING)
-                .eq("del_flag", 0));
-        return rows > 0 ? this.zwStopBillMapper.selectById(id) : null;
-    }
-
-    /**
-     * 否决：落"已打回"，单停在被否的那一道留痕；之后须走退回环节改回在核才能再签。
-     * 非"在核"单（含已打回）重复否决一律被拒。
-     */
-    @Override
-    public TZwStopBill reject(Long id, String approver, String comment) {
-        TZwStopBill r = this.zwStopBillMapper.selectById(id);
-        if (r == null || approver == null || approver.trim().isEmpty()) {
-            return null;
-        }
-        if (r.getStatus() == null || r.getStatus() != STATUS_RUNNING) {
-            return null;
-        }
-        int rows = this.zwStopBillMapper.update(null, new UpdateWrapper<TZwStopBill>()
-                // 否决必须把报批情形落成"已打回"——不许只留痕不落状态，让单子还挂在核里被重复签
-                .set("status", STATUS_VETO)
-                .set("remark", appendTrace(r.getRemark(),
-                        "打回 " + ts() + " " + approver + " " + safe(comment)))
-                .eq("id", id)
-                .eq("status", STATUS_RUNNING)
-                .eq("del_flag", 0));
-        return rows > 0 ? this.zwStopBillMapper.selectById(id) : null;
-    }
-
-    /**
-     * 退回上一环节：道次退一格、本口落印数清零、报批情形一并改回"在核"——
-     * 不许只退道次还留着"已核讫/已打回"，造成两边口径对不上。第一道无可退，被拒。
-     */
-    @Override
-    public TZwStopBill rollback(Long id, String comment) {
-        TZwStopBill r = this.zwStopBillMapper.selectById(id);
+        TZwStopBill r = findRunning(id, approver);
         if (r == null) {
             return null;
         }
-        int node = r.getNodeNo() == null ? 0 : r.getNodeNo();
-        if (node <= 0) {
+        // TODO 本道口够不够人还没点算：现在来一个人就往下推一道
+        advance(r);
+        this.zwStopBillMapper.updateById(r);
+        return this.zwStopBillMapper.selectById(id);
+    }
+
+    /** 另一种签法（同名重载）：调度评估口两名评估人各按落名口签，各评各的、互不替签 */
+    @Override
+    public TZwStopBill approve(Long id, String approver, String signRole, String comment) {
+        // TODO 还没实现：谁占过哪个落名口要顺签核台账点算，同一个人不能把两个口都占了
+        return approve(id, approver, comment);
+    }
+
+    @Override
+    public TZwStopBill reject(Long id, String approver, String comment) {
+        return reject(id, approver, null, comment);
+    }
+
+    @Override
+    public TZwStopBill reject(Long id, String approver, String signRole, String comment) {
+        TZwStopBill r = findRunning(id, approver);
+        if (r == null) {
             return null;
         }
-        int rows = this.zwStopBillMapper.update(null, new UpdateWrapper<TZwStopBill>()
-                .set("node_no", node - 1)
-                .set("sign_count", 0)
-                // 退回与改回在核同一条更新，超时重试/回滚后两边看到的都是"上一道在核"
-                .set("status", STATUS_RUNNING)
-                .set("remark", appendTrace(r.getRemark(), "退回 " + ts() + " " + safe(comment)))
-                .eq("id", id)
-                .eq("node_no", node)
-                .eq("del_flag", 0));
-        return rows > 0 ? this.zwStopBillMapper.selectById(id) : null;
+        // 写明不同意：单到此为止
+        r.setStatus(Integer.valueOf(STATUS_STOPPED));
+        this.zwStopBillMapper.updateById(r);
+        return this.zwStopBillMapper.selectById(id);
     }
 
-    private static String appendTrace(String old, String line) {
-        if (old == null || old.isEmpty()) {
-            return line;
+    @Override
+    public TZwStopBill withdraw(Long id, String applicant, String comment) {
+        TZwStopBill r = findRunning(id, applicant);
+        if (r == null) {
+            return null;
         }
-        return old + "；" + line;
+        // TODO 撤回也要在台账落一笔，之后谁也不往它身上追记
+        r.setStatus(Integer.valueOf(STATUS_STOPPED));
+        this.zwStopBillMapper.updateById(r);
+        return this.zwStopBillMapper.selectById(id);
     }
 
-    private static String safe(String s) {
-        return s == null ? "" : s;
+    @Override
+    public TZwStopBill rollback(Long id, String comment) {
+        TZwStopBill r = findRunning(id, null);
+        if (r == null) {
+            return null;
+        }
+        // TODO 打回要旧轮整轮作废：轮次加一、退回第二道，作废的与补签的不摆在一起
+        int node = nodeOf(r);
+        r.setNodeNo(Integer.valueOf(node > 1 ? node - 1 : 1));
+        this.zwStopBillMapper.updateById(r);
+        return this.zwStopBillMapper.selectById(id);
     }
 
-    private static String ts() {
-        return new SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(new Date());
+    @Override
+    public TZwStopBill sendBack(Long id, String approver, String comment) {
+        // TODO 主管认为理由不符把单打回：只有主管批准口能打回
+        return null;
+    }
+
+    @Override
+    public StopBillView buildView(Long id) {
+        TZwStopBill bill = this.zwStopBillMapper.selectById(id);
+        if (bill == null) {
+            return null;
+        }
+        // TODO 各关过没过、每口应到/已到几枚名，都要顺着当前轮签核台账一次点算出来
+        List<GateView> gates = new ArrayList<GateView>();
+        return new StopBillView(bill, gates, new ArrayList<com.fc.v2.model.auto.TZwStopSign>(),
+                new ArrayList<com.fc.v2.model.auto.TZwStopSign>());
+    }
+
+    /** 推进：未到主管批准口则进下一道口；主管批准口之后置为已核讫且各栏锁死 */
+    private void advance(TZwStopBill r) {
+        int node = nodeOf(r);
+        if (node >= MAX_NODE) {
+            r.setStatus(Integer.valueOf(STATUS_PASS));
+            return;
+        }
+        r.setNodeNo(Integer.valueOf(node + 1));
+    }
+
+    private TZwStopBill findRunning(Long id, String approver) {
+        if (id == null) {
+            return null;
+        }
+        if (approver != null && approver.trim().isEmpty()) {
+            return null;
+        }
+        TZwStopBill r = this.zwStopBillMapper.selectById(id);
+        if (r == null || r.getStatus() == null
+                || r.getStatus().intValue() != STATUS_RUNNING) {
+            return null;
+        }
+        int node = nodeOf(r);
+        if (node < 0 || node > MAX_NODE) {
+            return null;
+        }
+        return r;
+    }
+
+    private int nodeOf(TZwStopBill r) {
+        return r.getNodeNo() == null ? 0 : r.getNodeNo().intValue();
+    }
+
+    private int yearOf(Date d) {
+        java.util.Calendar c = java.util.Calendar.getInstance();
+        c.setTime(d);
+        return c.get(java.util.Calendar.YEAR);
     }
 }
